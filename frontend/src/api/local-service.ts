@@ -1,9 +1,8 @@
 import { MODULE_BY_KEY } from '@/data/modules'
+import { appendEvent, clearModuleEvents, findRecordedEvent, listModuleEvents } from '@/data/event-store'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import { decideTransition, mergeRowsWithEvents } from '@/data/status-flow'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
-
-// 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
-const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
 
 export function moduleMeta(key: string): ModuleMeta {
   const meta = MODULE_BY_KEY.get(key)
@@ -11,6 +10,18 @@ export function moduleMeta(key: string): ModuleMeta {
     throw new Error(`没有登记名为 ${key} 的业务模块`)
   }
   return meta
+}
+
+// 统一归并再落库：事件日志是唯一来源，归并结果写回后各入口看到的结论才一致。
+function mergeModuleRows(key: string): EntryRow[] {
+  const meta = moduleMeta(key)
+  const events = listModuleEvents(key)
+  if (events.length === 0) {
+    return listRows(key)
+  }
+  const merged = mergeRowsWithEvents(meta, listRows(key), events)
+  saveRows(key, merged)
+  return merged
 }
 
 export function filterRows(rows: EntryRow[], filters: Record<string, string>): EntryRow[] {
@@ -24,39 +35,45 @@ export function filterRows(rows: EntryRow[], filters: Record<string, string>): E
 }
 
 export function listEntries(key: string, filters: Record<string, string> = {}): PageResult {
-  const matched = filterRows(listRows(key), filters)
+  const matched = filterRows(mergeModuleRows(key), filters)
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
+// 各入口共用的提交口：只登记事件，不直接改状态字段。
+// 同一动作已归并过且状态仍停在它的结论上，说明是重复/并发提交，直接返回已登记的唯一结果。
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
   const target = meta.actionTargets[action]
   if (!target) {
     return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
   }
-  const rows = listRows(key)
-  const index = rows.findIndex((row) => Number(row.id) === id)
-  if (index < 0) {
+  const rows = mergeModuleRows(key)
+  const row = rows.find((item) => Number(item.id) === id)
+  if (!row) {
     return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
   }
-  const current = String(rows[index].status)
-  if (current === target) {
-    return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
+  const current = String(row.status)
+  const recorded = findRecordedEvent(key, id, action)
+  if (recorded && current === recorded.target) {
+    return { ok: true, message: recorded.message }
   }
-  const lastStatus = meta.statuses[meta.statuses.length - 1]
-  const updated: EntryRow = {
-    ...rows[index],
-    status: target,
-    pending: target !== lastStatus,
-    abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
+  const decision = decideTransition(meta, current, action)
+  if (!decision.ok) {
+    return decision
   }
-  const next = [...rows]
-  next[index] = updated
-  saveRows(key, next)
-  return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
+  const event = appendEvent({
+    moduleKey: key,
+    rowId: id,
+    action,
+    target,
+    message: `${meta.entity}已${action}，当前状态「${target}」`,
+  })
+  mergeModuleRows(key)
+  return { ok: true, message: event.message }
 }
 
 export function resetModule(key: string): PageResult {
+  clearModuleEvents(key)
   resetRows(key)
   return listEntries(key)
 }
@@ -65,7 +82,7 @@ export function exportEntries(key: string): { filename: string; content: string 
   const meta = moduleMeta(key)
   const header = ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
-  for (const row of listRows(key)) {
+  for (const row of mergeModuleRows(key)) {
     lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
   }
   return { filename: `${meta.name}-清单.csv`, content: `\uFEFF${lines.join('\n')}` }
@@ -85,6 +102,9 @@ export function downloadEntries(key: string): void {
 }
 
 export function loadOverview(): OverviewResult {
+  for (const meta of MODULE_BY_KEY.values()) {
+    mergeModuleRows(meta.key)
+  }
   const rows = allRows()
   const modules = [...MODULE_BY_KEY.values()].map((meta) => {
     const entries = rows[meta.key] ?? []
