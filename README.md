@@ -69,3 +69,26 @@ npm run build
   `frontend/src/data/seed.ts`。
 - 状态流转只允许在 `local-service.ts` 里改，页面组件不做业务判断。
 - 想回到初始数据：清掉浏览器里 `hydrology-monitor-station:entries` 这一项，或调用 `resetModule(模块)`。
+
+### 断面测量：状态单一来源（事件溯源）
+
+断面测量记录的「提交校核 / 确认校核 / 安排重测」三个入口历史上各自直接改 `status`
+字段，多处覆盖会得出不一致结论。现把状态写收拢到事件台账，任何入口都不再改字段：
+
+- `src/data/crosssection/workflow.ts`：唯一状态机与归并规则。入口只追加不可变事件
+  （`submitEvent`），当前状态由事件流按顺序在状态机上归并（fold）投影得到，
+  结论只有一个；越级、重复操作一律拒绝且不落事件。
+  - 流转边：`已测量→待校核→已校核`，`待校核→需重测→待校核`。
+  - 历史重测归并：「需重测」是持续态，直到下一次「提交校核」才回到「待校核」，
+    期间重复安排重测不改变结论；无事件历史的既有记录用其既有落库状态钉一条基线，
+    归并从基线开始，兼容历史结论。
+- `src/data/crosssection/event-store.ts`：事件台账的 localStorage 持久化（只追加），
+  键为 `hydrology-monitor-station:crosssection-workflow`。
+- 行存储（`local-store.ts`）只保存断面名称、起点距、河底高程等业务字段，
+  `status/pending/abnormal` 一律在读取时由事件流投影，写入时剥离。
+- 幂等与并发：一次提交带一个 `requestId` 凭据，同一凭据并发/重放只产生一次处理结果；
+  同一条记录的提交按记录串行排队，不同记录互不阻塞。
+- 页面核对清单由当前投影状态下的合法动作生成（`allowedActionsFor`），动作完成后
+  先归并事件、再读列表，直接展示落库结果。
+- 想清空事件台账：`resetModule('crosssection')` 或清掉
+  `hydrology-monitor-station:crosssection-workflow`。
